@@ -8,3 +8,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+trivy-*.txt
+sbom-*.json
+*.cdx.json
