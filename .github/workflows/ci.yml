@@ -1,67 +1,78 @@
-# =========================================================
-# САМОСТОЯТЕЛЬНАЯ РАБОТА
-# =========================================================
-#
-# Разработайте CI-пайплайн согласно разделу 5.4.1.
-#
-# Необходимо самостоятельно настроить:
-# 1. запуск при push в main;
-# 2. запуск при Pull Request в main;
-# 3. Ubuntu;
-# 4. checkout исходного кода;
-# 5. установку Python с кэшированием;
-# 6. установку зависимостей;
-# 7. lint;
-# 8. тесты с покрытием / Quality Gate;
-# 9. build;
-# 10. при желании — сохранение отчёта покрытия.
-#
-# Готовый workflow здесь намеренно не приводится.
-# =========================================================
-name: Build
+name: CI and staging promotion
 on:
   push:
-    branches: [ main ]
+    branches: [main, lab3-integration-promotion]
+    paths-ignore:
+      - 'k8s-manifests/**'
+      - 'docs/**'
+      - '*.md'
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
 
-
-permissions:        
+permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  unit-tests:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Lint
-        run: flake8 app tests
-
-      - name: Test with coverage
-        run: pytest
-
-      - name: Build
-        run: python -m compileall app
-
-      - name: Upload coverage report
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: flake8 app tests
+      - run: pytest tests/test_app.py
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage.xml
+
+  integration-tests:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Sequential timing
+        run: /usr/bin/time -p -o sequential-time.txt pytest tests/integration --no-cov --junitxml=sequential-results.xml --log-cli-level=WARNING
+      - name: Parallel timing
+        run: /usr/bin/time -p -o parallel-time.txt pytest tests/integration --no-cov -n auto --junitxml=parallel-results.xml --log-cli-level=WARNING
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-results
+          path: |
+            *-time.txt
+            *-results.xml
+
+  build:
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.image.outputs.tag }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: image
+        name: Image identity
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/myapp" >> "$GITHUB_OUTPUT"
       - name: Настройка Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -131,3 +142,62 @@ jobs:
           docker tag myapp:${{ env.SHORT_SHA }} $IMAGE:${{ github.run_number }}
           docker push $IMAGE:${{ env.SHORT_SHA }}
           docker push $IMAGE:${{ github.run_number }}
+  promote-to-staging:
+    needs: [integration-tests, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.promote.outputs.image }}
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Copy verified image without rebuilding
+        id: promote
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login ghcr.io --username "$REGISTRY_USER" --password-stdin
+          SOURCE="docker://${IMAGE}:${TAG}"
+          TARGET="docker://${IMAGE}-staging:${TAG}"
+          skopeo copy --all --preserve-digests "$SOURCE" "$TARGET"
+          skopeo inspect "$TARGET" | tee staging-image.json
+          test "$(skopeo inspect --format '{{.Digest}}' "$SOURCE")" = "$(skopeo inspect --format '{{.Digest}}' "$TARGET")"
+          echo "image=${IMAGE}-staging:${TAG}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: staging-image
+          path: staging-image.json
+
+  update-manifest:
+    needs: promote-to-staging
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install PyYAML==6.0.3
+      - name: Update desired staging state in Git
+        env:
+          STAGING_IMAGE: ${{ needs.promote-to-staging.outputs.image }}
+        run: |
+          python scripts/update_manifest.py
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add k8s-manifests/staging/deployment.yaml
+          if git diff --cached --quiet; then exit 0; fi
+          git diff --cached
+          git commit -m "Deploy ${STAGING_IMAGE##*:} to staging [skip ci]"
+          git push origin HEAD:main
+          git log -p -1 -- k8s-manifests/staging/deployment.yaml

@@ -11,3 +11,4 @@ htmlcov/
 trivy-*.txt
 sbom-*.json
 *.cdx.json
+*-results.xml

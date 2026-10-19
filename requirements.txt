@@ -2,3 +2,7 @@ Flask==3.1.2
 pytest==8.4.1
 pytest-cov==6.2.1
 flake8==7.3.0
+psycopg2-binary==2.9.11
+redis==6.4.0
+testcontainers[postgres,redis]==4.13.2
+pytest-xdist==3.8.0
