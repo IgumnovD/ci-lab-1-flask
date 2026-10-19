@@ -8,7 +8,7 @@ def test_first_request_uses_database(services):
     client, conn, cache = services
     response = client.get("/visits")
     assert response.status_code == 200
-    assert response.get_json() == {"count": 999, "source": "db", "lastId": 1}
+    assert response.get_json() == {"count": 1, "source": "db", "lastId": 1}
     assert row_count(conn) == 1
     assert cache.get("visits_count") == b"1"
     assert 0 < cache.ttl("visits_count") <= 10
